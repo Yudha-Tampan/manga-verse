@@ -1,455 +1,459 @@
-// api.js - Real-time Scraping Engine
-import { CONFIG } from 'config.js';
-import { state } from 'state.js';
-
-class ScrapingEngine {
-    constructor() {
-        this.abortControllers = new Map();
-        this.requestQueue = [];
-        this.activeRequests = 0;
-        this.cache = new Map();
-        this.rateLimiter = new RateLimiter(CONFIG.network.rateLimit);
-        this.circuitBreaker = new CircuitBreaker(CONFIG.network.circuitBreaker);
-        this.selectorEngine = new AdaptiveSelectorEngine();
-        this.init();
-    }
-
-    init() {
-        this.setupRequestInterceptor();
-        this.startQueueProcessor();
-    }
-
-    setupRequestInterceptor() {
-        const originalFetch = window.fetch;
-        window.fetch = async (...args) => {
-            const requestId = Math.random().toString(36).substring(7);
-            const controller = new AbortController();
-            this.abortControllers.set(requestId, controller);
-
-            try {
-                const response = await originalFetch(args[0], {
-                    ...args[1],
-                    signal: controller.signal
-                });
-                return response;
-            } finally {
-                this.abortControllers.delete(requestId);
-            }
-        };
-    }
-
-    async scrape(endpoint, options = {}) {
-        const requestId = Math.random().toString(36).substring(7);
+const API = (function() {
+    // Private variables
+    const requestQueue = [];
+    let activeRequests = 0;
+    const abortControllers = new Map();
+    const circuitBreakers = new Map();
+    const requestFingerprints = new Set();
+    const sourceHealth = new Map();
+    
+    // Initialize source health
+    CONFIG.API.SOURCES.forEach(source => {
+        sourceHealth.set(source.id, {
+            health: 1.0,
+            failures: 0,
+            lastFailure: 0,
+            blacklistedUntil: 0
+        });
+    });
+    
+    // Adaptive selectors storage
+    const selectorScores = new Map();
+    
+    // Core scraping function
+    async function scrape(url, options = {}) {
+        const fingerprint = `${url}_${JSON.stringify(options)}`;
         
-        // Check cache
-        const cacheKey = `${endpoint}-${JSON.stringify(options)}`;
-        const cached = this.getFromCache(cacheKey);
-        if (cached && !options.bypassCache) {
-            return cached;
+        // Deduplicate requests
+        if (requestFingerprints.has(fingerprint)) {
+            return null;
         }
-
-        // Check rate limit
-        if (!this.rateLimiter.allow()) {
-            throw new Error('Rate limit exceeded');
-        }
-
+        requestFingerprints.add(fingerprint);
+        setTimeout(() => requestFingerprints.delete(fingerprint), 5000);
+        
         // Check circuit breaker
-        if (this.circuitBreaker.isOpen()) {
-            throw new Error('Circuit breaker is open');
+        const sourceId = options.sourceId || 'default';
+        if (isCircuitBroken(sourceId)) {
+            console.warn(`Circuit breaker open for ${sourceId}`);
+            return fallbackScrape(url, options);
         }
-
-        try {
-            const result = await this.makeRequest(endpoint, options, requestId);
-            this.circuitBreaker.recordSuccess();
-            
-            // Cache result
-            this.addToCache(cacheKey, result, options.ttl);
-            
-            return result;
-        } catch (error) {
-            this.circuitBreaker.recordFailure();
-            state.addError(error);
-            
-            // Try fallback source
-            if (options.fallback) {
-                return await this.tryFallback(endpoint, options);
+        
+        // Rate limiting
+        await rateLimit(sourceId);
+        
+        // Queue management
+        if (activeRequests >= CONFIG.API.RATE_LIMIT.MAX_CONCURRENT) {
+            await new Promise(resolve => requestQueue.push(resolve));
+        }
+        
+        activeRequests++;
+        
+        const abortController = new AbortController();
+        const requestId = `${url}_${Date.now()}`;
+        abortControllers.set(requestId, abortController);
+        
+        let retries = 0;
+        let lastError;
+        
+        while (retries < CONFIG.API.RETRY.MAX_ATTEMPTS) {
+            try {
+                const response = await fetchWithTimeout(url, {
+                    signal: abortController.signal,
+                    ...options
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                const html = await response.text();
+                const doc = parseAndSanitize(html);
+                const data = extractData(doc, options.selectors);
+                
+                // Update source health on success
+                updateSourceHealth(sourceId, true);
+                
+                // Cache the result
+                cacheResult(url, data);
+                
+                return data;
+                
+            } catch (error) {
+                lastError = error;
+                retries++;
+                
+                if (retries < CONFIG.API.RETRY.MAX_ATTEMPTS) {
+                    const delay = exponentialBackoff(retries);
+                    await wait(delay);
+                }
             }
-            
+        }
+        
+        // Update source health on failure
+        updateSourceHealth(sourceId, false);
+        
+        // Try fallback source
+        return fallbackScrape(url, options);
+    }
+    
+    // Fetch with timeout
+    async function fetchWithTimeout(url, options) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        
+        try {
+            const response = await fetch(url, {
+                ...options,
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            return response;
+        } catch (error) {
+            clearTimeout(timeoutId);
             throw error;
         }
     }
-
-    async makeRequest(endpoint, options, requestId) {
-        const controller = this.abortControllers.get(requestId);
-        const timeoutId = setTimeout(() => {
-            controller?.abort();
-        }, options.timeout || CONFIG.network.timeout);
-
-        try {
-            let url = endpoint;
-            let response;
-
-            // Handle different source types
-            if (options.source) {
-                response = await this.scrapeFromSource(options.source, endpoint, options);
-            } else {
-                // Use proxy if configured
-                if (CONFIG.security.useProxy) {
-                    url = `${CONFIG.security.corsProxy}${encodeURIComponent(endpoint)}`;
-                }
-
-                response = await fetch(url, {
-                    headers: {
-                        'User-Agent': CONFIG.scraping.userAgent,
-                        ...options.headers
-                    },
-                    signal: controller?.signal
-                });
-            }
-
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
-
-            const data = await this.parseResponse(response, options);
-            
-            // Validate content
-            if (CONFIG.scraping.validateContent) {
-                this.validateContent(data, options.validation);
-            }
-
-            // Sanitize if needed
-            if (CONFIG.scraping.sanitizeHTML && typeof data === 'string') {
-                return this.sanitizeHTML(data);
-            }
-
-            return data;
-
-        } catch (error) {
-            clearTimeout(timeoutId);
-            
-            if (error.name === 'AbortError') {
-                throw new Error('Request timeout');
-            }
-            
-            throw error;
-        }
+    
+    // Exponential backoff
+    function exponentialBackoff(retryCount) {
+        const delay = CONFIG.API.RETRY.BASE_DELAY * Math.pow(2, retryCount - 1);
+        return Math.min(delay, CONFIG.API.RETRY.MAX_DELAY);
     }
-
-    async scrapeFromSource(source, endpoint, options) {
-        const sourceConfig = CONFIG.sources.find(s => s.id === source);
-        if (!sourceConfig) {
-            throw new Error(`Unknown source: ${source}`);
-        }
-
-        const url = `${sourceConfig.baseUrl}${endpoint}`;
-        
-        const response = await fetch(url, {
-            headers: {
-                'User-Agent': CONFIG.scraping.userAgent
-            }
-        });
-
-        if (!response.ok) {
-            throw new Error(`Source ${source} returned ${response.status}`);
-        }
-
-        const html = await response.text();
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-
-        return this.extractData(doc, sourceConfig.selectors, options);
-    }
-
-    extractData(doc, selectors, options) {
-        const result = {};
-
-        for (const [key, selector] of Object.entries(selectors)) {
-            try {
-                // Try primary selector
-                let elements = doc.querySelectorAll(selector);
-                
-                // If no results and adaptive selectors enabled, try to find alternatives
-                if (elements.length === 0 && CONFIG.scraping.adaptiveSelectors) {
-                    elements = this.selectorEngine.findAlternative(doc, selector);
-                }
-
-                result[key] = this.processElements(elements, key, options);
-            } catch (error) {
-                console.error(`Failed to extract ${key}:`, error);
-                
-                // Try fallback selector
-                if (options.fallbackSelectors?.[key]) {
-                    const elements = doc.querySelectorAll(options.fallbackSelectors[key]);
-                    result[key] = this.processElements(elements, key, options);
-                }
-            }
-        }
-
-        return result;
-    }
-
-    processElements(elements, key, options) {
-        const processed = [];
-
-        for (const element of elements) {
-            let value;
-
-            // Determine extraction method based on key
-            if (key.includes('image') || key.includes('cover')) {
-                value = element.src || element.dataset.src || element.getAttribute('data-src');
-            } else if (key.includes('link') || key.includes('href')) {
-                value = element.href;
-            } else {
-                value = element.textContent.trim();
-            }
-
-            // Apply transformations
-            if (options.transform?.[key]) {
-                value = options.transform[key](value);
-            }
-
-            if (value) {
-                processed.push(value);
-            }
-        }
-
-        return options.single ? processed[0] : processed;
-    }
-
-    async tryFallback(endpoint, options) {
-        const fallbackSources = CONFIG.sources
-            .filter(s => s.fallback && s.id !== options.source)
-            .sort((a, b) => a.priority - b.priority);
-
-        for (const source of fallbackSources) {
-            try {
-                console.log(`Trying fallback source: ${source.id}`);
-                return await this.scrape(endpoint, {
-                    ...options,
-                    source: source.id,
-                    fallback: false
-                });
-            } catch (error) {
-                console.error(`Fallback ${source.id} failed:`, error);
-                continue;
-            }
-        }
-
-        throw new Error('All sources failed');
-    }
-
-    async parseResponse(response, options) {
-        const contentType = response.headers.get('content-type');
-
-        if (contentType?.includes('application/json')) {
-            return await response.json();
-        } else if (contentType?.includes('text/html')) {
-            const html = await response.text();
-            
-            if (options.parseHTML) {
-                return new DOMParser().parseFromString(html, 'text/html');
-            }
-            
-            return html;
-        } else if (contentType?.includes('image')) {
-            const blob = await response.blob();
-            return URL.createObjectURL(blob);
-        }
-
-        return await response.text();
-    }
-
-    validateContent(data, validation = {}) {
-        if (!data) {
-            throw new Error('Empty response');
-        }
-
-        if (validation.minLength && data.length < validation.minLength) {
-            throw new Error('Content too short');
-        }
-
-        if (validation.requiredFields) {
-            for (const field of validation.requiredFields) {
-                if (!data[field]) {
-                    throw new Error(`Missing required field: ${field}`);
-                }
-            }
-        }
-
-        return true;
-    }
-
-    sanitizeHTML(html) {
-        const temp = document.createElement('div');
-        temp.innerHTML = html;
-        
-        // Remove potentially dangerous elements
-        const scripts = temp.getElementsByTagName('script');
-        while (scripts.length > 0) {
-            scripts[0].remove();
-        }
-        
-        const iframes = temp.getElementsByTagName('iframe');
-        while (iframes.length > 0) {
-            iframes[0].remove();
-        }
-
-        return temp.innerHTML;
-    }
-
-    addToCache(key, value, ttl = CONFIG.cache.ttl.mangaList) {
-        this.cache.set(key, {
-            value,
-            timestamp: Date.now(),
-            ttl
-        });
-
-        // Auto cleanup old cache entries
-        setTimeout(() => {
-            this.cache.delete(key);
-        }, ttl);
-    }
-
-    getFromCache(key) {
-        const entry = this.cache.get(key);
-        
-        if (!entry) {
-            return null;
-        }
-
-        if (Date.now() - entry.timestamp > entry.ttl) {
-            this.cache.delete(key);
-            return null;
-        }
-
-        return entry.value;
-    }
-
-    startQueueProcessor() {
-        setInterval(() => {
-            this.processQueue();
-        }, 100);
-    }
-
-    async processQueue() {
-        if (this.requestQueue.length === 0 || this.activeRequests >= CONFIG.network.maxConcurrent) {
-            return;
-        }
-
-        const request = this.requestQueue.shift();
-        this.activeRequests++;
-
-        try {
-            const result = await this.makeRequest(request.endpoint, request.options);
-            request.resolve(result);
-        } catch (error) {
-            request.reject(error);
-        } finally {
-            this.activeRequests--;
-        }
-    }
-
-    abortRequest(requestId) {
-        const controller = this.abortControllers.get(requestId);
-        if (controller) {
-            controller.abort();
-            this.abortControllers.delete(requestId);
-        }
-    }
-
-    abortAllRequests() {
-        for (const [id, controller] of this.abortControllers) {
-            controller.abort();
-            this.abortControllers.delete(id);
-        }
-    }
-}
-
-class RateLimiter {
-    constructor(maxRequestsPerMinute) {
-        this.maxRequests = maxRequestsPerMinute;
-        this.requests = [];
-    }
-
-    allow() {
+    
+    // Rate limiting
+    async function rateLimit(sourceId) {
         const now = Date.now();
-        this.requests = this.requests.filter(time => now - time < 60000);
-
-        if (this.requests.length < this.maxRequests) {
-            this.requests.push(now);
-            return true;
-        }
-
-        return false;
-    }
-}
-
-class CircuitBreaker {
-    constructor(options) {
-        this.failureThreshold = options.failureThreshold;
-        this.resetTimeout = options.resetTimeout;
-        this.failures = 0;
-        this.state = 'CLOSED';
-        this.nextAttempt = Date.now();
-    }
-
-    recordSuccess() {
-        this.failures = 0;
-        this.state = 'CLOSED';
-    }
-
-    recordFailure() {
-        this.failures++;
+        const source = sourceHealth.get(sourceId);
         
-        if (this.failures >= this.failureThreshold) {
-            this.state = 'OPEN';
-            this.nextAttempt = Date.now() + this.resetTimeout;
+        if (source) {
+            const timeSinceLastRequest = now - (source.lastRequest || 0);
+            if (timeSinceLastRequest < 1000 / CONFIG.API.RATE_LIMIT.MAX_REQUESTS) {
+                await wait(1000 / CONFIG.API.RATE_LIMIT.MAX_REQUESTS - timeSinceLastRequest);
+            }
+            source.lastRequest = now;
         }
     }
-
-    isOpen() {
-        if (this.state === 'OPEN') {
-            if (Date.now() > this.nextAttempt) {
-                this.state = 'HALF_OPEN';
+    
+    // Circuit breaker
+    function isCircuitBroken(sourceId) {
+        const breaker = circuitBreakers.get(sourceId);
+        if (!breaker) return false;
+        
+        if (breaker.failures >= CONFIG.API.CIRCUIT_BREAKER.THRESHOLD) {
+            if (Date.now() - breaker.lastFailure > CONFIG.API.CIRCUIT_BREAKER.TIMEOUT) {
+                circuitBreakers.delete(sourceId);
                 return false;
             }
             return true;
         }
         return false;
     }
-}
-
-class AdaptiveSelectorEngine {
-    constructor() {
-        this.selectorPatterns = [
-            { type: 'class', pattern: /manga|series|title/i },
-            { type: 'class', pattern: /chapter|episode/i },
-            { type: 'class', pattern: /image|cover|thumbnail/i },
-            { type: 'tag', pattern: /img|a|div|span/i },
-            { type: 'attribute', pattern: /src|href|data-src/i }
-        ];
-    }
-
-    findAlternative(doc, originalSelector) {
-        const elements = [];
-
-        // Try common patterns
-        for (const pattern of this.selectorPatterns) {
-            if (pattern.type === 'class') {
-                const matches = Array.from(doc.querySelectorAll('[class*="' + pattern.pattern.source.slice(1, -2) + '"]'));
-                elements.push(...matches);
-            } else if (pattern.type === 'tag') {
-                const matches = Array.from(doc.querySelectorAll(pattern.pattern.source));
-                elements.push(...matches);
+    
+    // Update source health
+    function updateSourceHealth(sourceId, success) {
+        const health = sourceHealth.get(sourceId) || {
+            health: 1.0,
+            failures: 0,
+            lastFailure: 0
+        };
+        
+        if (success) {
+            health.health = Math.min(1.0, health.health + 0.1);
+            health.failures = 0;
+        } else {
+            health.health = Math.max(0, health.health - 0.2);
+            health.failures++;
+            health.lastFailure = Date.now();
+            
+            if (health.failures >= CONFIG.API.CIRCUIT_BREAKER.THRESHOLD) {
+                circuitBreakers.set(sourceId, {
+                    failures: health.failures,
+                    lastFailure: Date.now()
+                });
             }
         }
-
-        // Remove duplicates
-        return [...new Set(elements)];
+        
+        sourceHealth.set(sourceId, health);
     }
-}
+    
+    // Parse and sanitize HTML
+    function parseAndSanitize(html) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        
+        // Remove potentially harmful elements
+        const scripts = doc.getElementsByTagName('script');
+        while (scripts.length > 0) {
+            scripts[0].remove();
+        }
+        
+        return doc;
+    }
+    
+    // Extract data with adaptive selectors
+    function extractData(doc, selectors) {
+        const data = [];
+        
+        // Try primary selectors
+        let items = doc.querySelectorAll(selectors.manga);
+        
+        // If no items, try fallback selectors
+        if (items.length === 0 && selectors.fallback) {
+            items = doc.querySelectorAll(selectors.fallback.manga);
+            updateSelectorScore(selectors.manga, false);
+        }
+        
+        items.forEach(item => {
+            try {
+                const manga = {
+                    id: generateId(),
+                    title: extractText(item, selectors.title),
+                    image: extractImage(item, selectors.image),
+                    chapters: extractChapters(item, selectors.chapter),
+                    rating: extractRating(item, selectors.rating),
+                    lastUpdated: Date.now()
+                };
+                
+                // Validate and normalize
+                if (validateManga(manga)) {
+                    data.push(normalizeManga(manga));
+                }
+            } catch (error) {
+                console.warn('Error extracting manga:', error);
+            }
+        });
+        
+        return data;
+    }
+    
+    // Extract text with fallback
+    function extractText(element, selector) {
+        const el = element.querySelector(selector);
+        return el ? el.textContent.trim() : 'Unknown Title';
+    }
+    
+    // Extract image URL
+    function extractImage(element, selector) {
+        const img = element.querySelector(selector);
+        if (!img) return 'https://via.placeholder.com/200x300?text=No+Image';
+        
+        let src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+        
+        // Normalize URL
+        if (src && !src.startsWith('http')) {
+            src = 'https:' + src;
+        }
+        
+        return src || 'https://via.placeholder.com/200x300?text=No+Image';
+    }
+    
+    // Extract chapters
+    function extractChapters(element, selector) {
+        const chapterEl = element.querySelector(selector);
+        if (!chapterEl) return 0;
+        
+        const text = chapterEl.textContent;
+        const match = text.match(/\d+/);
+        return match ? parseInt(match[0]) : 0;
+    }
+    
+    // Extract rating
+    function extractRating(element, selector) {
+        const ratingEl = element.querySelector(selector);
+        if (!ratingEl) return 0;
+        
+        const text = ratingEl.textContent;
+        const match = text.match(/\d+\.?\d*/);
+        return match ? parseFloat(match[0]) : 0;
+    }
+    
+    // Validate manga data
+    function validateManga(manga) {
+        return manga.title && manga.title !== 'Unknown Title';
+    }
+    
+    // Normalize manga schema
+    function normalizeManga(manga) {
+        return {
+            ...manga,
+            normalizedTitle: manga.title.toLowerCase().replace(/[^\w\s]/g, ''),
+            popularity: calculatePopularity(manga),
+            trending: calculateTrending(manga)
+        };
+    }
+    
+    // Calculate popularity score
+    function calculatePopularity(manga) {
+        return (manga.rating * 0.6) + (manga.chapters * 0.4);
+    }
+    
+    // Calculate trending score
+    function calculateTrending(manga) {
+        const age = (Date.now() - manga.lastUpdated) / (1000 * 60 * 60 * 24);
+        return manga.popularity * Math.exp(-age * 0.1);
+    }
+    
+    // Update selector score for adaptive learning
+    function updateSelectorScore(selector, success) {
+        const score = selectorScores.get(selector) || 0;
+        selectorScores.set(selector, success ? score + 1 : score - 1);
+    }
+    
+    // Generate unique ID
+    function generateId() {
+        return 'manga_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+    }
+    
+    // Cache management
+    const cache = new Map();
+    
+    function cacheResult(key, data) {
+        cache.set(key, {
+            data,
+            timestamp: Date.now(),
+            expiry: Date.now() + CONFIG.API.CACHE.TTL
+        });
+        
+        // Rotate cache if too large
+        if (cache.size > CONFIG.API.CACHE.MAX_SIZE) {
+            const oldest = Array.from(cache.entries())
+                .sort((a, b) => a[1].timestamp - b[1].timestamp)[0];
+            cache.delete(oldest[0]);
+        }
+    }
+    
+    function getCached(key) {
+        const cached = cache.get(key);
+        if (cached && cached.expiry > Date.now()) {
+            return cached.data;
+        }
+        cache.delete(key);
+        return null;
+    }
+    
+    // Fallback to mirror source
+    async function fallbackScrape(url, options) {
+        const sources = CONFIG.API.SOURCES
+            .filter(s => s.id !== options.sourceId)
+            .sort((a, b) => a.priority - b.priority);
+        
+        for (const source of sources) {
+            if (!isCircuitBroken(source.id)) {
+                try {
+                    const data = await scrape(source.url + url, {
+                        ...options,
+                        sourceId: source.id,
+                        selectors: source.selectors
+                    });
+                    if (data) return data;
+                } catch (error) {
+                    console.warn(`Fallback failed for ${source.id}:`, error);
+                }
+            }
+        }
+        
+        return null;
+    }
+    
+    // Wait utility
+    function wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+    
+    // Prefetch next page
+    async function prefetchNextPage(currentPage) {
+        if (activeRequests >= CONFIG.API.RATE_LIMIT.MAX_CONCURRENT) return;
+        
+        const nextPage = currentPage + 1;
+        const url = `/page/${nextPage}`;
+        
+        // Use requestIdleCallback for non-blocking prefetch
+        if ('requestIdleCallback' in window) {
+            requestIdleCallback(() => {
+                scrape(url, { prefetch: true });
+            }, { timeout: 2000 });
+        } else {
+            setTimeout(() => scrape(url, { prefetch: true }), 1000);
+        }
+    }
+    
+    // Public API
+    return {
+        async getMangaList(page = 1, filters = {}) {
+            const cacheKey = `mangalist_${page}_${JSON.stringify(filters)}`;
+            const cached = getCached(cacheKey);
+            if (cached) return cached;
+            
+            const source = CONFIG.API.SOURCES[0];
+            const data = await scrape(source.url + '/manga-list', {
+                sourceId: source.id,
+                selectors: source.selectors
+            });
+            
+            // Prefetch next page in background
+            prefetchNextPage(page);
+            
+            return data;
+        },
+        
+        async getMangaDetails(id) {
+            const cacheKey = `manga_${id}`;
+            const cached = getCached(cacheKey);
+            if (cached) return cached;
+            
+            const source = CONFIG.API.SOURCES[0];
+            return await scrape(source.url + `/manga/${id}`, {
+                sourceId: source.id,
+                selectors: source.selectors
+            });
+        },
+        
+        async searchManga(query) {
+            const cacheKey = `search_${query}`;
+            const cached = getCached(cacheKey);
+            if (cached) return cached;
+            
+            const source = CONFIG.API.SOURCES[0];
+            return await scrape(source.url + `/search?q=${encodeURIComponent(query)}`, {
+                sourceId: source.id,
+                selectors: source.selectors
+            });
+        },
+        
+        async getTrending() {
+            const data = await this.getMangaList();
+            return data.sort((a, b) => b.trending - a.trending);
+        },
+        
+        async getPopular() {
+            const data = await this.getMangaList();
+            return data.sort((a, b) => b.popularity - a.popularity);
+        },
+        
+        async getLatest() {
+            const data = await this.getMangaList();
+            return data.sort((a, b) => b.lastUpdated - a.lastUpdated);
+        },
+        
+        // Cancel stale requests
+        cancelRequest(requestId) {
+            const controller = abortControllers.get(requestId);
+            if (controller) {
+                controller.abort();
+                abortControllers.delete(requestId);
+            }
+        },
+        
+        // Clear cache
+        clearCache() {
+            cache.clear();
+        },
+        
+        // Get source health
+        getSourceHealth() {
+            return Object.fromEntries(sourceHealth);
+        }
+    };
+})();
 
-export const api = new ScrapingEngine();
-export default api;
+window.API = API;

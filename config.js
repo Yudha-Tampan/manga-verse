@@ -1,129 +1,91 @@
-// config.js - Enterprise Configuration Management
-export const CONFIG = {
-    // API Endpoints & Mirrors
-    sources: [
-        {
-            id: 'mangadex',
-            name: 'MangaDex',
-            baseUrl: 'https://api.mangadex.org',
-            listEndpoint: '/manga',
-            chapterEndpoint: '/chapter',
-            imageEndpoint: '/at-home/server',
-            priority: 1,
-            active: true,
-            selectors: {
-                title: 'attributes.title.en',
-                cover: 'relationships.[filename]',
-                chapters: 'data'
+const CONFIG = {
+    APP: {
+        NAME: 'MangaVerse',
+        VERSION: '1.0.0',
+        DEFAULT_VIEW: 'home'
+    },
+    
+    API: {
+        SOURCES: [
+            {
+                id: 'manga1',
+                url: 'https://ww5.manganelo.tv',
+                priority: 1,
+                health: 1.0,
+                selectors: {
+                    manga: '.content-genres-item',
+                    title: '.genres-item-name',
+                    image: 'img',
+                    chapter: '.genres-item-chap',
+                    rating: '.genres-item-rate'
+                },
+                fallbackSelectors: {
+                    manga: '.panel-content-genres-item',
+                    title: '.genres-item-name',
+                    image: 'img',
+                    chapter: '.chapter-item',
+                    rating: '.item-rate'
+                }
+            },
+            {
+                id: 'manga2',
+                url: 'https://mangabat.com',
+                priority: 2,
+                health: 1.0,
+                selectors: {
+                    manga: '.list-truyen-item-wrap',
+                    title: '.jtip',
+                    image: 'img',
+                    chapter: '.chapter-item',
+                    rating: '.rate-this'
+                },
+                fallbackSelectors: {
+                    manga: '.item',
+                    title: 'h3 a',
+                    image: 'img',
+                    chapter: '.chapter a',
+                    rating: '.rating'
+                }
             }
+        ],
+        
+        CACHE: {
+            TTL: 5 * 60 * 1000, // 5 minutes
+            MAX_SIZE: 100,
+            WARMUP_INTERVAL: 30 * 1000 // 30 seconds
         },
-        {
-            id: 'mangapill',
-            name: 'MangaPill',
-            baseUrl: 'https://mangapill.com',
-            listEndpoint: '/api/manga',
-            priority: 2,
-            active: true,
-            fallback: true
-        }
-    ],
-
-    // Performance & Caching
-    cache: {
-        ttl: {
-            mangaList: 5 * 60 * 1000, // 5 minutes
-            mangaDetail: 10 * 60 * 1000, // 10 minutes
-            chapters: 15 * 60 * 1000, // 15 minutes
-            images: 30 * 60 * 1000 // 30 minutes
+        
+        RATE_LIMIT: {
+            MAX_REQUESTS: 10,
+            WINDOW: 1000, // 1 second
+            MAX_CONCURRENT: 3
         },
-        maxSize: 50 * 1024 * 1024, // 50MB
-        cleanupInterval: 60 * 1000 // 1 minute
-    },
-
-    // Network & Requests
-    network: {
-        timeout: 10000, // 10 seconds
-        retryAttempts: 3,
-        retryDelay: 1000, // 1 second
-        maxConcurrent: 5,
-        rateLimit: 100, // requests per minute
-        backoffFactor: 1.5,
-        circuitBreaker: {
-            failureThreshold: 5,
-            resetTimeout: 30000 // 30 seconds
+        
+        RETRY: {
+            MAX_ATTEMPTS: 3,
+            BASE_DELAY: 1000,
+            MAX_DELAY: 5000
+        },
+        
+        CIRCUIT_BREAKER: {
+            THRESHOLD: 5,
+            TIMEOUT: 30000 // 30 seconds
         }
     },
-
-    // Scraping Engine
-    scraping: {
-        userAgent: 'Mangaverse/1.0',
-        parseTimeout: 5000,
-        maxRedirects: 3,
-        validateContent: true,
-        sanitizeHTML: true,
-        adaptiveSelectors: true,
-        selectorFallback: true,
-        mirrorSwitch: true,
-        contentValidation: {
-            minTitleLength: 3,
-            maxTitleLength: 200,
-            minChapters: 1,
-            maxChapters: 10000,
-            allowedImageFormats: ['jpg', 'jpeg', 'png', 'webp']
+    
+    UI: {
+        GRID_COLS: {
+            mobile: 2,
+            tablet: 4,
+            desktop: 6
+        },
+        SKELETON_COUNT: 12,
+        LAZY_LOAD_OFFSET: 200,
+        TRANSITIONS: {
+            DURATION: 300,
+            EASING: 'ease'
         }
-    },
-
-    // Feature Flags
-    features: {
-        pwa: true,
-        offlineMode: true,
-        recommendations: true,
-        bookmarks: true,
-        history: true,
-        achievements: true,
-        debugMode: false,
-        analytics: true,
-        experimentalReader: false
-    },
-
-    // UI Configuration
-    ui: {
-        defaultTheme: 'dark',
-        defaultReaderMode: 'vertical',
-        defaultFontSize: 16,
-        defaultBrightness: 100,
-        compactThreshold: 768,
-        infiniteScroll: true,
-        prefetchChapters: 2,
-        imageQuality: 85,
-        lazyLoadImages: true
-    },
-
-    // Security
-    security: {
-        corsProxy: 'https://cors-anywhere.herokuapp.com/',
-        useProxy: false,
-        sanitizeInput: true,
-        escapeHTML: true,
-        maxImageSize: 10 * 1024 * 1024, // 10MB
-        allowedDomains: ['mangadex.org', 'mangapill.com']
-    },
-
-    // Development
-    dev: {
-        logLevel: 'error', // debug, info, warn, error
-        performanceMonitoring: true,
-        memoryTracking: true,
-        networkTracking: true,
-        mockData: false
     }
 };
 
-// Environment-specific overrides
-if (import.meta.env && import.meta.env.PROD) {
-    CONFIG.dev.logLevel = 'error';
-    CONFIG.features.debugMode = false;
-    CONFIG.security.useProxy = true;
-}
-
-export default CONFIG;
+Object.freeze(CONFIG);
