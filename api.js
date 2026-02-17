@@ -1,6 +1,6 @@
 // api.js - Real-time Scraping Engine
-import { CONFIG } from './config.js';
-import { state } from './state.js';
+import { CONFIG } from 'config.js';
+import { state } from 'state.js';
 
 class ScrapingEngine {
     constructor() {
